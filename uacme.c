@@ -66,9 +66,14 @@ typedef struct acme {
     const char *directory;
     const char *hook;
     const char *email;
+    const char *webroot;
+    char *chlgdir;  /* if webroot is used, contains allocated space for dir + token  */
+    char *chlgfile; /* points at the end of the directory part of chlgdir */
     char *keyprefix;
     char *certprefix;
 } acme_t;
+
+#define MAX_TOKEN_LEN 512
 
 #if !HAVE_STRCASESTR
 char *strcasestr(const char *haystack, const char *needle)
@@ -873,7 +878,24 @@ bool authorize(acme_t *a)
                     warnx("failed to generate authorization key");
                     goto out;
                 }
-                if (a->hook && strlen(a->hook) > 0) {
+                if (a->webroot) {
+                    msg(2, "token=%s", token);
+                    msg(2, "key_auth=%s", key_auth);
+                    if (strlen(token) > MAX_TOKEN_LEN) {
+                        warnx("token is too long");
+                        goto out;
+                    }
+                    strcpy(a->chlgfile, token);
+                    msg(1, "creating challenge response file %s", a->chlgdir);
+                    int fd = open(a->chlgdir, O_WRONLY|O_CREAT|O_TRUNC, S_IRUSR|S_IRGRP|S_IROTH);
+                    if (fd < 0 || write(fd, key_auth, strlen(key_auth) != strlen(key_auth))) {
+                        warn("failed to create challenge in %s", a->chlgdir);
+                        if (fd >= 0)
+                            close(fd);
+                        goto out;
+                    }
+                    close(fd);
+                } else if (a->hook && strlen(a->hook) > 0) {
                     msg(2, "type=%s", type);
                     msg(2, "ident=%s", ident_value);
                     msg(2, "token=%s", token);
@@ -928,7 +950,11 @@ bool authorize(acme_t *a)
                         sleep(5);
                     }
                 }
-                if (a->hook && strlen(a->hook) > 0) {
+                if (a->webroot) {
+                    msg(1, "cleaning up challenge file %s", a->chlgdir);
+                    if (unlink(a->chlgdir))
+                        warn("failed to remove challenge file %s", a->chlgdir);
+                } else if (a->hook && strlen(a->hook) > 0) {
                     const char *method = chlg_done ? "done" : "failed";
                     msg(1, "running %s %s %s %s %s %s", a->hook, method,
                             type, ident_value, token, key_auth);
@@ -1362,7 +1388,8 @@ void usage(const char *progname)
         "\t[-d|--days DAYS] [-e|--eab KEYID:KEY] [-f|--force] [-h|--hook PROG]\n"
         "\t[-l|--alternate [N | SHA256]] [-m|--must-staple] [-n|--never-create]\n"
         "\t[-o|--no-ocsp] [-s|--staging] [-t|--type RSA | EC]\n"
-        "\t[-v|--verbose ...] [-V|--version] [-y|--yes] [-?|--help]\n"
+        "\t[-v|--verbose ...] [-V|--version] [-w|--webroot DIR]\n"
+        "\t[-y|--yes] [-?|--help]\n"
         "\tnew [EMAIL] | update [EMAIL] | deactivate | newkey |\n"
         "\tissue IDENTIFIER [ALTNAME ...]] | issue CSRFILE |\n"
         "\trevoke CERTFILE [CERTKEYFILE]\n", progname);
@@ -1402,6 +1429,7 @@ int main(int argc, char **argv)
         {"type",         required_argument, NULL, 't'},
         {"verbose",      no_argument,       NULL, 'v'},
         {"version",      no_argument,       NULL, 'V'},
+        {"webroot",      required_argument, NULL, 'w'},
         {"yes",          no_argument,       NULL, 'y'},
         {NULL,           0,                 NULL, 0}
     };
@@ -1456,7 +1484,7 @@ int main(int argc, char **argv)
     while (1) {
         char *endptr;
         int option_index;
-        int c = getopt_long(argc, argv, "a:b:c:d:e:f?h:l:mnost:vVy",
+        int c = getopt_long(argc, argv, "a:b:c:d:e:f?h:l:mnost:vVw:y",
                 options, &option_index);
         if (c == -1) break;
         switch (c) {
@@ -1521,6 +1549,10 @@ int main(int argc, char **argv)
 
             case 'v':
                 g_loglevel++;
+                break;
+
+            case 'w':
+                a.webroot = optarg;
                 break;
 
             case 's':
@@ -1704,6 +1736,26 @@ int main(int argc, char **argv)
         goto out;
     }
 
+    if (a.webroot) {
+        int l = strlen(a.webroot);
+        char *webdir = (char*) malloc(l + 29 + MAX_TOKEN_LEN), *c = webdir + l;
+        if (!webdir) {
+            warnx("memory allocation failed");
+            goto out;
+        }
+        strcpy(webdir, a.webroot);
+        /* add trailing / if needed */
+        if (*webdir && c[-1] != '/')
+            *(c++) = '/';
+        strcpy(c, ".well-known/acme-challenge/");
+        a.chlgdir = webdir;
+        a.chlgfile = c + 27;
+        if (access(a.chlgdir, W_OK | X_OK) < 0) {
+            warn("cannot write in %s, make sure it exists and is writable", a.chlgdir);
+            goto out;
+        }
+    }
+
     if (!a.key) {
         if (asprintf(&a.keyprefix, "%s/private", confdir) < 0) {
             a.keyprefix = NULL;
@@ -1837,6 +1889,8 @@ out:
     free(a.certprefix);
     if (a.key)
         privkey_deinit(a.key);
+    if (a.chlgdir) /* chlgfile points inside chlgdir so free only the latter */
+        free(a.chlgdir);
     if (key)
         privkey_deinit(key);
     free(keyprefix);
